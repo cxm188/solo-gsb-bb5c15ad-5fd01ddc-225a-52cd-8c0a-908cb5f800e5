@@ -536,33 +536,83 @@ def _apply_migrations_in_tx(conn: sqlite3.Connection) -> list[Migration]:
     return applied
 
 
+def _acquire_migration_lock(conn: sqlite3.Connection) -> float:
+    """在 MIGRATION_LOCK_TIMEOUT_SECONDS 硬上限内取得 BEGIN IMMEDIATE 写锁。
+
+    连接自身的 busy_timeout（生产连接为 5000ms）会让单条 BEGIN IMMEDIATE 在
+    SQLite 内部阻塞到该时长；若该时长超过迁移锁配置上限，Python 侧的截止时间
+    根本来不及生效，表现为“配置 0.2 秒失败却等了约 5 秒”。因此每次尝试前把
+    busy_timeout 收缩为“剩余预算”与重试间隔的较小值（毫秒取整），使单次阻塞
+    绝不越过截止时间；整个等待周期仍按 _MIGRATION_LOCK_RETRY_INTERVAL_SECONDS
+    的既有节奏重试。返回实际等待秒数。
+    """
+    original_busy_timeout = int(
+        conn.execute("PRAGMA busy_timeout").fetchone()[0])
+    start = time.monotonic()
+    deadline = start + MIGRATION_LOCK_TIMEOUT_SECONDS
+    last_locked_error: sqlite3.OperationalError | None = None
+    try:
+        while True:
+            # 单次 SQLite 内部阻塞最多一个既有重试间隔，且不超过剩余预算
+            # （毫秒取整，下限 1ms），使总等待时间以
+            # MIGRATION_LOCK_TIMEOUT_SECONDS 为硬上限、重试节奏保持不变。
+            # 首轮即便预算为 0 也照常尝试一次：无竞争的库应立即得手。
+            remaining = max(0.0, deadline - time.monotonic())
+            per_attempt_ms = max(
+                1, int(min(remaining, _MIGRATION_LOCK_RETRY_INTERVAL_SECONDS)
+                       * 1000))
+            conn.execute(f"PRAGMA busy_timeout={per_attempt_ms}")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                return time.monotonic() - start
+            except sqlite3.OperationalError as exc:
+                # 另一进程正在迁移：等待后重试；重试时重新走“读历史→复核”全流程。
+                if "locked" not in str(exc).lower():
+                    raise
+                last_locked_error = exc
+                wait_remaining = deadline - time.monotonic()
+                if wait_remaining <= 0:
+                    elapsed = time.monotonic() - start
+                    raise MigrationError(
+                        "无法在 "
+                        f"{MIGRATION_LOCK_TIMEOUT_SECONDS:g} 秒内取得数据库写锁"
+                        f"（实际等待 {elapsed:.3f} 秒，可能有进程长时间占用），"
+                        "本次启动放弃迁移；请确认其它实例已完成迁移后重启。"
+                    ) from last_locked_error
+                # 仍按既有间隔重试，但不睡过截止时间。
+                time.sleep(min(_MIGRATION_LOCK_RETRY_INTERVAL_SECONDS,
+                               wait_remaining))
+    finally:
+        # 恢复连接原有 busy_timeout：迁移结束（成功/超时）后连接交还调用方，
+        # 业务写事务仍按其原配置在锁竞争时等待。
+        conn.execute(f"PRAGMA busy_timeout={original_busy_timeout}")
+
+
 def run_migrations(conn: sqlite3.Connection) -> None:
     """在 BEGIN IMMEDIATE 事务中把数据库收敛到 LATEST_VERSION。
 
     可安全并发调用：SQLite 的 BEGIN IMMEDIATE 保证同一时刻只有一个进程/线程
-    取得保留锁执行迁移；后来者拿锁时阻塞/重试等待，拿到后在同一函数内重新读取
-    schema_migrations 复核结果——发现版本已登记则只探测不执行，绝不重复 ALTER。
-    整轮迁移单事务提交：中途任何失败整体 ROLLBACK（连 schema_migrations 的建表
-    也回滚），下次启动从同一状态重试。
+    取得保留锁执行迁移；后来者拿锁时按 _MIGRATION_LOCK_RETRY_INTERVAL_SECONDS
+    的间隔重试，总等待时间以 MIGRATION_LOCK_TIMEOUT_SECONDS 为硬上限（不被连接
+    busy_timeout 的内部阻塞拉长），拿到后在同一函数内重新读取 schema_migrations
+    复核结果——发现版本已登记则只探测不执行，绝不重复 ALTER。整轮迁移单事务
+    提交：中途任何失败整体 ROLLBACK（连 schema_migrations 的建表也回滚），
+    超时未拿到锁时连接仍在自动提交态、库内容原样保留，下次启动从同一状态重试。
     """
     with DB_LOCK:
         # 外部连接可能处于 sqlite3 隐式事务模式且残留未提交状态；先提交到干净点，
         # 以便下面显式 BEGIN IMMEDIATE（autocommit 连接上 commit() 为空操作）。
         conn.commit()
-        deadline = time.monotonic() + MIGRATION_LOCK_TIMEOUT_SECONDS
-        while True:
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                break
-            except sqlite3.OperationalError as exc:
-                # 另一进程正在迁移：等待后重试；重试时重新走“读历史→复核”全流程。
-                if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
-                    raise MigrationError(
-                        "无法在 "
-                        f"{MIGRATION_LOCK_TIMEOUT_SECONDS:.0f} 秒内取得数据库写锁"
-                        "（可能有进程长时间占用），本次启动放弃迁移；"
-                        "请确认其它实例已完成迁移后重启。") from exc
-                time.sleep(_MIGRATION_LOCK_RETRY_INTERVAL_SECONDS)
+        try:
+            _acquire_migration_lock(conn)
+        except MigrationError:
+            raise
+        except sqlite3.OperationalError as exc:
+            # 非锁竞争类错误（如磁盘 I/O 错误）：BEGIN 未成功，无事务可回滚，
+            # 库状态未被改动，统一翻译为 MigrationError 拒绝启动。
+            raise MigrationError(
+                f"取得数据库写锁失败：{exc}。数据库保持启动前状态；"
+                "修复问题后重新启动即可重试。") from exc
         try:
             applied = _apply_migrations_in_tx(conn)
         except BaseException:

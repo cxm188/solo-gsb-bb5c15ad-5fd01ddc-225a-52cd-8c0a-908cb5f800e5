@@ -5,8 +5,10 @@ app.db.run_migrations，不触碰进程级共享连接（UPLOAD_DB_PATH）。
 """
 import hashlib
 import os
+import re
 import sqlite3
 import threading
+import time
 
 import pytest
 
@@ -427,6 +429,150 @@ def test_waiter_revalidates_after_other_process_finished(tmp_path, monkeypatch):
     assert result.execute(
         "SELECT max(version) FROM schema_migrations").fetchone()[0] == \
         db.LATEST_VERSION
+    result.close()
+
+
+def test_lock_wait_times_out_at_configured_hard_limit(tmp_path, monkeypatch):
+    """短超时锁竞争：连接 busy_timeout(5000ms) 远大于配置超时时，run_migrations
+    必须在 MIGRATION_LOCK_TIMEOUT_SECONDS 附近失败——而非在 BEGIN IMMEDIATE 内
+    阻塞约 5 秒——抛 MigrationError，且库状态与连接 busy_timeout 原样保留。"""
+    path = tmp_path / "short_timeout.db"
+    seed = sqlite3.connect(path)
+    seed.executescript(OLDEST_SCHEMA)
+    seed.commit()
+    seed.close()
+
+    timeout = 0.2
+    monkeypatch.setattr(db, "MIGRATION_LOCK_TIMEOUT_SECONDS", timeout)
+    monkeypatch.setattr(db, "_MIGRATION_LOCK_RETRY_INTERVAL_SECONDS", 0.05)
+
+    first_holds = threading.Event()
+    release = threading.Event()
+
+    def holder():
+        holder_conn = sqlite3.connect(path)
+        holder_conn.execute("BEGIN IMMEDIATE")
+        first_holds.set()
+        release.wait(timeout=10)
+        holder_conn.rollback()
+        holder_conn.close()
+
+    th = threading.Thread(target=holder)
+    th.start()
+    try:
+        assert first_holds.wait(timeout=10)
+        conn = _connect(path)  # timeout=30 -> busy_timeout 30000ms
+        conn.execute("PRAGMA busy_timeout=5000")
+        # busy_timeout=5000ms 的连接此前已是干净状态，无残留事务
+        assert conn.in_transaction is False
+
+        started = time.monotonic()
+        with pytest.raises(db.MigrationError) as exc_info:
+            db.run_migrations(conn)
+        elapsed = time.monotonic() - started
+        message = str(exc_info.value)
+
+        # 硬上限：不得被连接 busy_timeout 拉长到约 5 秒（允许调度误差）
+        assert elapsed < timeout + 0.5, f"elapsed={elapsed:.3f}"
+        assert elapsed >= timeout
+        # 错误信息准确显示配置秒数与实际小数秒
+        assert re.search(r"0\.2 秒内", message)
+        match = re.search(r"实际等待 ([0-9.]+) 秒", message)
+        assert match is not None
+        assert abs(float(match.group(1)) - elapsed) < 0.1
+        # 保留原始库状态：未纳管旧库、旧数据原样保留
+        assert conn.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='table'"
+            " AND name='schema_migrations'").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT total_chunks FROM sessions WHERE id='old-sid'"
+        ).fetchone()[0] == 3
+        # 失败后未遗留事务，连接原有 busy_timeout 已恢复
+        assert conn.in_transaction is False
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+        conn.close()
+    finally:
+        release.set()
+        th.join(10)
+
+
+def test_lock_wait_succeeds_after_release_with_short_timeout(tmp_path,
+                                                             monkeypatch):
+    """短超时下持锁者在截止时间前释放并完成迁移：等待方按既有间隔重试，抢到锁后
+    重新读取并校验迁移历史，不重复执行任何版本（版本恰好应用一次）。"""
+    path = tmp_path / "released.db"
+    seed = sqlite3.connect(path)
+    seed.executescript(OLDEST_SCHEMA)
+    seed.commit()
+    seed.close()
+
+    timeout = 3.0
+    hold_seconds = 0.5
+    monkeypatch.setattr(db, "MIGRATION_LOCK_TIMEOUT_SECONDS", timeout)
+    monkeypatch.setattr(db, "_MIGRATION_LOCK_RETRY_INTERVAL_SECONDS", 0.02)
+
+    first_holds = threading.Event()
+    release = threading.Event()
+    holder_errors = []
+    waiter_timing = []
+
+    def holder():
+        holder_conn = _connect(path)
+        holder_conn.execute("BEGIN IMMEDIATE")
+        first_holds.set()
+        try:
+            release.wait(timeout=10)
+            holder_conn.rollback()
+            # 释放后立刻在同一连接完成迁移（等待方仍在抢锁重试）
+            db.run_migrations(holder_conn)
+        except Exception as exc:  # noqa: BLE001
+            holder_errors.append(exc)
+        finally:
+            holder_conn.close()
+
+    def waiter():
+        first_holds.wait(timeout=10)
+        conn = _connect(path)
+        conn.execute("PRAGMA busy_timeout=5000")
+        started = time.monotonic()
+        try:
+            db.run_migrations(conn)
+            waiter_timing.append(time.monotonic() - started)
+        except Exception as exc:  # noqa: BLE001
+            waiter_timing.append(exc)
+        finally:
+            conn.close()
+
+    th = threading.Thread(target=holder)
+    tw = threading.Thread(target=waiter)
+    th.start()
+    tw.start()
+    try:
+        assert first_holds.wait(timeout=10)
+        time.sleep(hold_seconds)
+        release.set()
+        tw.join(10)
+    finally:
+        release.set()
+        th.join(10)
+
+    assert holder_errors == []
+    assert len(waiter_timing) == 1
+    elapsed = waiter_timing[0]
+    assert isinstance(elapsed, float), elapsed
+    # 等到了释放（约 hold_seconds），且远未触及 3 秒超时
+    assert hold_seconds - 0.1 <= elapsed < timeout
+
+    result = sqlite3.connect(path)
+    assert [r[0] for r in result.execute(
+        "SELECT version FROM schema_migrations ORDER BY version")] == \
+        list(range(1, db.LATEST_VERSION + 1))
+    # 等待方复核后没有重复 ALTER：每个补列只出现一次
+    cols = [r[1] for r in result.execute("PRAGMA table_info(sessions)")]
+    for name in ("max_active_leases", "revision", "tenant_id"):
+        assert cols.count(name) == 1
+    assert result.execute(
+        "SELECT total_chunks FROM sessions WHERE id='old-sid'").fetchone()[0] == 3
     result.close()
 
 
