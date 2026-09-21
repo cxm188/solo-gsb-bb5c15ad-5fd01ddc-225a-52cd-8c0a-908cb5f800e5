@@ -7,6 +7,7 @@ import hashlib
 import os
 import sqlite3
 import threading
+import time
 
 import pytest
 
@@ -427,6 +428,88 @@ def test_waiter_revalidates_after_other_process_finished(tmp_path, monkeypatch):
     assert result.execute(
         "SELECT max(version) FROM schema_migrations").fetchone()[0] == \
         db.LATEST_VERSION
+    result.close()
+
+
+# ---------------------------------------------------------------- 迁移锁等待上限
+
+def test_lock_wait_is_capped_by_configured_timeout(tmp_path, monkeypatch):
+    """配置的超时小于连接 busy_timeout 时，总等待以配置为硬上限及时失败。"""
+    path = tmp_path / "capped.db"
+    _migrate(path).close()  # 已纳管库：排除迁移执行耗时，只测抢锁等待
+
+    monkeypatch.setattr(db, "MIGRATION_LOCK_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(db, "_MIGRATION_LOCK_RETRY_INTERVAL_SECONDS", 0.01)
+
+    holder = _connect(path)
+    holder.execute("BEGIN IMMEDIATE")  # 模拟另一进程长期占有写锁
+    waiter = _connect(path)            # busy_timeout=30s，远大于配置的 0.5s
+    try:
+        started = time.monotonic()
+        with pytest.raises(db.MigrationError,
+                           match=r"无法在 0\.5 秒内取得数据库写锁"):
+            db.run_migrations(waiter)
+        elapsed = time.monotonic() - started
+        # 硬上限生效：确实等到了配置时长，且远小于连接 busy_timeout（30s）
+        # ——修复前 BEGIN IMMEDIATE 会在 SQLite 内部阻塞约 30s 才报错
+        assert 0.5 <= elapsed < 5
+        # 连接状态复原：busy_timeout 恢复原值、未遗留事务
+        assert waiter.execute("PRAGMA busy_timeout").fetchone()[0] == 30000
+        assert not waiter.in_transaction
+    finally:
+        waiter.close()
+        holder.rollback()
+        holder.close()
+
+    # 原始库状态未被改动：仍是全部版本已登记的已纳管库
+    check = sqlite3.connect(path)
+    assert check.execute(
+        "SELECT count(*) FROM schema_migrations").fetchone()[0] == \
+        db.LATEST_VERSION
+    check.close()
+
+
+def test_lock_released_within_timeout_migration_succeeds(tmp_path, monkeypatch):
+    """持锁方在配置窗口内释放：等待方按既有间隔重试，抢到锁后复核并完成迁移。"""
+    path = tmp_path / "released.db"
+    seed = sqlite3.connect(path)
+    seed.executescript(OLDEST_SCHEMA)
+    seed.commit()
+    seed.close()
+
+    monkeypatch.setattr(db, "MIGRATION_LOCK_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setattr(db, "_MIGRATION_LOCK_RETRY_INTERVAL_SECONDS", 0.01)
+
+    holder = _connect(path)
+    holder.execute("BEGIN IMMEDIATE")
+    errors = []
+
+    def waiter():
+        try:
+            conn = _connect(path)
+            db.run_migrations(conn)
+            conn.close()
+        except Exception as exc:  # noqa: BLE001 - 断言在主线程进行
+            errors.append(exc)
+
+    t = threading.Thread(target=waiter)
+    t.start()
+    time.sleep(0.3)    # 让等待方先经历若干次抢锁失败（走的是重试循环）
+    holder.rollback()  # 在超时窗口内释放写锁
+    holder.close()
+    t.join(30)
+
+    assert errors == []
+    result = sqlite3.connect(path)
+    assert [r[0] for r in result.execute(
+        "SELECT version FROM schema_migrations ORDER BY version")] == \
+        list(range(1, db.LATEST_VERSION + 1))
+    # 抢到锁后重新读取并校验迁移历史：已登记版本未重复执行，每个补列只出现一次
+    cols = [r[1] for r in result.execute("PRAGMA table_info(sessions)")]
+    for name in ("tenant_id", "revision", "verification_required"):
+        assert cols.count(name) == 1
+    assert result.execute(
+        "SELECT total_chunks FROM sessions WHERE id='old-sid'").fetchone()[0] == 3
     result.close()
 
 

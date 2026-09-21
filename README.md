@@ -48,9 +48,12 @@ docker compose up --build
   打开了新库）——报错并拒绝启动。
 
 **并发启动（多进程/多副本同时启动）：** `BEGIN IMMEDIATE` 保证同一时刻只有一个
-进程取得写锁执行迁移；其它进程在忙等窗口内等待（默认最多 30 秒，
-`MIGRATION_LOCK_TIMEOUT_SECONDS` 可调），拿到锁后**重新读取迁移表复核结果**：
-已登记的版本只做结构探测、绝不重复执行，因此不会出现重复 `ALTER TABLE`/重复建表。
+进程取得写锁执行迁移；其它进程按固定间隔重试等待，总等待时间以
+`MIGRATION_LOCK_TIMEOUT_SECONDS`（默认 30 秒）为**硬上限**——抢锁期间连接的
+`busy_timeout` 被临时绕过，配置值小于 `busy_timeout` 时也能按配置及时失败。
+拿到锁后**重新读取迁移表复核结果**：已登记的版本只做结构探测、绝不重复执行，
+因此不会出现重复 `ALTER TABLE`/重复建表。超时抛错放弃本次启动，数据库保持
+原状态，由编排层重试。
 
 **失败恢复：** 整轮迁移（含 `schema_migrations` 建表）在单个事务内提交，任何
 步骤失败都会**整体 ROLLBACK**，数据库保持启动前的一致状态，不会留下“迁移了
@@ -107,7 +110,7 @@ request_id/令牌重放等）与之前完全一致。
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `UPLOAD_DB_PATH` | `/data/coordinator.db` | SQLite 数据库文件路径 |
-| `MIGRATION_LOCK_TIMEOUT_SECONDS` | `30` | 并发启动时等待其它进程释放迁移写锁的最长秒数，超时放弃本次启动 |
+| `MIGRATION_LOCK_TIMEOUT_SECONDS` | `30` | 并发启动时等待其它进程释放迁移写锁的最长秒数（总等待硬上限，不受连接 busy_timeout 影响；支持小数），超时放弃本次启动 |
 | `DEFAULT_LEASE_TTL_SECONDS` | `300` | 租约默认有效期（秒） |
 | `MAX_LEASE_TTL_SECONDS` | `3600` | 租约有效期上限（秒），超出会被截断 |
 | `DEFAULT_VERIFICATION_TTL_SECONDS` | `300` | 验收令牌默认有效期（秒），缺省跟随 `DEFAULT_LEASE_TTL_SECONDS` |

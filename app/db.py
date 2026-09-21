@@ -450,8 +450,10 @@ CREATE TABLE IF NOT EXISTS tenants (
 LATEST_VERSION = MIGRATIONS[-1].version
 _MIGRATIONS_BY_VERSION = {m.version: m for m in MIGRATIONS}
 
-# 并发启动时等待其它进程释放写锁的最长时间；超时仍拿不到锁则按明确错误失败，
-# 由编排层（restart: unless-stopped / 人工）重试。
+# 并发启动时等待其它进程释放写锁的最长时间（总等待的硬上限）：超时仍拿不到锁
+# 则按明确错误失败，由编排层（restart: unless-stopped / 人工）重试。
+# 连接的 busy_timeout 不参与这段等待：抢锁期间它被临时降为 0，由重试循环自己
+# 按固定间隔控制节奏，保证配置值小于 busy_timeout 时也能按配置及时失败。
 MIGRATION_LOCK_TIMEOUT_SECONDS = float(
     os.environ.get("MIGRATION_LOCK_TIMEOUT_SECONDS", "30"))
 _MIGRATION_LOCK_RETRY_INTERVAL_SECONDS = 0.1
@@ -536,11 +538,47 @@ def _apply_migrations_in_tx(conn: sqlite3.Connection) -> list[Migration]:
     return applied
 
 
+def _acquire_migration_lock(conn: sqlite3.Connection) -> None:
+    """在 MIGRATION_LOCK_TIMEOUT_SECONDS 硬上限内取得 BEGIN IMMEDIATE 保留锁。
+
+    连接级 busy_timeout（共享连接上为 5000ms）会让 BEGIN IMMEDIATE 在 SQLite
+    内部阻塞到 busy_timeout 耗尽才报 locked，配置值更小的等待上限会被它吞掉。
+    因此抢锁期间先把 busy_timeout 临时降为 0，让锁冲突立即失败，由本循环按
+    固定间隔重试、以 monotonic 时钟控制总时长（每次休眠不超过剩余预算）；
+    无论成败都在返回前恢复连接原 busy_timeout，超时抛 MigrationError 时连接
+    不在任何事务中，数据库保持原状态。
+    """
+    original_busy_timeout = int(
+        conn.execute("PRAGMA busy_timeout").fetchone()[0])
+    conn.execute("PRAGMA busy_timeout=0")
+    try:
+        deadline = time.monotonic() + MIGRATION_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                return
+            except sqlite3.OperationalError as exc:
+                # 另一进程正在迁移：按既有间隔重试；抢到锁后由调用方在同一事务内
+                # 重新走“读历史→复核”全流程，已登记的版本只探测不重复执行。
+                remaining = deadline - time.monotonic()
+                if "locked" not in str(exc).lower() or remaining <= 0:
+                    raise MigrationError(
+                        "无法在 "
+                        f"{MIGRATION_LOCK_TIMEOUT_SECONDS:g} 秒内取得数据库写锁"
+                        "（可能有进程长时间占用），本次启动放弃迁移；"
+                        "请确认其它实例已完成迁移后重启。") from exc
+                time.sleep(
+                    min(_MIGRATION_LOCK_RETRY_INTERVAL_SECONDS, remaining))
+    finally:
+        conn.execute(f"PRAGMA busy_timeout={original_busy_timeout}")
+
+
 def run_migrations(conn: sqlite3.Connection) -> None:
     """在 BEGIN IMMEDIATE 事务中把数据库收敛到 LATEST_VERSION。
 
     可安全并发调用：SQLite 的 BEGIN IMMEDIATE 保证同一时刻只有一个进程/线程
-    取得保留锁执行迁移；后来者拿锁时阻塞/重试等待，拿到后在同一函数内重新读取
+    取得保留锁执行迁移；后来者以 MIGRATION_LOCK_TIMEOUT_SECONDS 为硬上限等待
+    （连接 busy_timeout 被临时绕过，不参与计时），拿到锁后在同一函数内重新读取
     schema_migrations 复核结果——发现版本已登记则只探测不执行，绝不重复 ALTER。
     整轮迁移单事务提交：中途任何失败整体 ROLLBACK（连 schema_migrations 的建表
     也回滚），下次启动从同一状态重试。
@@ -549,20 +587,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         # 外部连接可能处于 sqlite3 隐式事务模式且残留未提交状态；先提交到干净点，
         # 以便下面显式 BEGIN IMMEDIATE（autocommit 连接上 commit() 为空操作）。
         conn.commit()
-        deadline = time.monotonic() + MIGRATION_LOCK_TIMEOUT_SECONDS
-        while True:
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                break
-            except sqlite3.OperationalError as exc:
-                # 另一进程正在迁移：等待后重试；重试时重新走“读历史→复核”全流程。
-                if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
-                    raise MigrationError(
-                        "无法在 "
-                        f"{MIGRATION_LOCK_TIMEOUT_SECONDS:.0f} 秒内取得数据库写锁"
-                        "（可能有进程长时间占用），本次启动放弃迁移；"
-                        "请确认其它实例已完成迁移后重启。") from exc
-                time.sleep(_MIGRATION_LOCK_RETRY_INTERVAL_SECONDS)
+        _acquire_migration_lock(conn)
         try:
             applied = _apply_migrations_in_tx(conn)
         except BaseException:
